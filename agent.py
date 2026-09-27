@@ -1,67 +1,66 @@
 """
-nav agent: map -> plan -> follow, replanning as the world changes.
+nav agent for the autonomy challenge.
 
-APPROACH (top-level overview)
-  every tick:  estimate pose  ->  stitch scan into map  ->  check / replan path  ->  follow path  ->  (vx, vy)
+how it works
+  every tick the robot does 4 things: figure out where it is, add the new scan to its map, check if its path is
+  still ok (replan if not), then drive along the path.
 
-  1. pose filter.  the sim's dynamics are exact and public (clamp speed, then clamp the change in velocity), so we replay
-     our own commands to know our true velocity and predict our position.  a small complementary gain pulls that
-     prediction toward the noisy measurement.  jitter drops from ~2 cm to a few mm.
+  1. position.  the pose we get is noisy (~2 cm).  but the sim physics are simple and known (speed gets capped, then
+     the change in speed gets capped), so I copy that exact math to know the robot's real velocity and predict where it
+     should be.  each tick I nudge that guess a little toward the noisy reading, which gets the error down to a few mm.
+     at the start I just average the first few readings so it settles fast.
 
-  2. map.  a 0.1 m grid, each cell UNKNOWN / FREE / BLOCKED.  every scan overwrites the cells it covers ("latest
-     observation wins"), in both directions: free->blocked (pop-up obstacles) and blocked->free (removed walls).
-     the scan's contents are cut around the robot's TRUE cell, but its origin is reported from the NOISY pose, so a raw
-     scan can land one cell off.  we recompute the origin from our filtered pose instead, and when the filtered pose sits
-     within a few mm of a cell boundary we try both candidate origins and keep the one that agrees best with the map.
-     without this, walls jitter by 10 cm, the 0.8 m corridor (05) closes, and "latest wins" flickers.
+  2. map.  a 0.1 m grid where every cell is unknown, free or blocked.  whatever the latest scan shows wins, so walls
+     can appear (08) and disappear (09, 11).
+     catch: the scan is cut around the robot's real cell, but its origin is given from the noisy pose, so sometimes the
+     whole scan lands one cell off.  I work out the origin from my filtered position instead, and if I'm right on a cell
+     edge I try both options and keep the one that matches the map better.  without this, walls jump around by 10 cm
+     and the corridor in 05 closes up.
 
-  3. clearance.  for every cell we track how far its centre is from the nearest blocked cell, bucketed into rings
-     (0.33, 0.36, 0.40 ... 0.80 m), maintained incrementally with per-ring counters when cells change.
-       - ring 0 (< 0.33 m) is hard inflation: the planner never enters it.  0.33 = robot radius 0.30 + 3 cm, which still
-         leaves the exact two-cell channel in the 0.8 m corridor (those cell centres are 0.35 m from each wall).
-       - outer rings add a soft cost, so paths prefer open space but can still squeeze through tight gaps.
-     field edges count as walls.
+  3. staying away from walls.  for each cell I track roughly how far it is from the nearest wall (only updated when
+     cells change, so it's cheap).
+       - closer than 0.33 m (robot radius 0.30 + 3 cm) is off limits.  that still leaves the 2-cell gap in the 05
+         corridor open, anything bigger closes it.
+       - a bit further out costs extra, so paths keep away from walls when there's room but can still squeeze through.
+     the field edges count as walls.
 
-  4. UNKNOWN SPACE IS PLANNED AS FREE (optimistic / "free-space assumption").  why: the goal is always reachable, and
-     most of the field starts unseen, so a pessimistic planner would have no path at all (03, 06, 07 need us to plan
-     into the unknown and discover the wall).  it is safe because the scan reaches 2.5 m while braking from 2 m/s
-     takes 0.5 m, so anything in our way shows up long before we need to react.
+  4. unknown space counts as free.  I plan as if anything I haven't seen yet is empty.  the goal is always reachable
+     and most of the map starts unseen, so if unknown counted as blocked there'd be no path at all in 03, 06 and 07.
+     it's safe because the robot sees 2.5 m ahead and only needs 0.5 m to stop from full speed.
 
-  5. planner.  8-connected A* with an octile heuristic.  a diagonal move is only allowed if both orthogonal neighbours
-     are passable, so the path can never slip between two blocked cells that touch at a corner.  if the start or goal is
-     inside hard inflation (04, or a noisy pose sample), it is snapped to the nearest passable cell by BFS.
-     the raw staircase is then shortcut ("string pulling"): from each anchor, extend to the farthest waypoint still in
-     line of sight.  line of sight is an exact continuous clearance check (see _los), not just a cell walk.
+  5. planning.  A* on the grid in 8 directions.  a diagonal move is only allowed if both side cells are free, so the
+     path can't slip between two walls that touch at a corner.  if the start or goal is too close to a wall (04), it
+     gets moved to the nearest ok cell.  then I straighten out the zig-zag by skipping points whenever there's a clear
+     straight line (checked properly along the whole line in _los, not just cell by cell).
 
-  6. drivable curve + speed profile.  each corner of the smoothed path is replaced by a circular arc tangent to both
-     legs.  a robot at speed v with lateral acceleration A_TURN follows radius v^2 / A_TURN, so a bigger arc = a faster
-     corner.  the arc is as big as the legs and the room at the corner allow, and every arc is checked for clearance
-     (radius halved until it fits).  the curve is sampled every ~5 cm; each sample gets a speed cap from its curvature,
-     then a backward pass guarantees we can always brake in time (v^2 = v_next^2 + 2 a d) and a forward pass keeps
-     acceleration realistic.  the goal itself needs no stop: the run ends as soon as we are inside 0.25 m.
+  6. corners and speed.  sharp corners get swapped for circular arcs.  going faster needs a bigger arc (radius
+     v^2 / a), so the arc size sets the corner speed.  every arc gets checked against the walls and shrunk until it
+     fits.  then along the path: slow down for tight curves, always leave enough room to brake for the next one
+     (v^2 = v_next^2 + 2ad), and don't plan to speed up faster than the robot can.  no need to stop at the goal, the run
+     ends as soon as we're within 0.25 m.
 
-  7. follower.  the robot is holonomic, so following = velocity along the path tangent (feedforward) plus a small pull
-     back onto the path (feedback).  we deliberately do NOT chase a lookahead point (pure pursuit): that cuts inside
-     every arc by ~lookahead^2 / (2 R), about 3 cm on tight corners, which caused collisions in testing.
+  7. driving.  the robot can move in any direction, so I point the velocity along the path and add a small push back
+     toward it if it drifts.  chasing a point ahead on the path (pure pursuit) cuts the inside of every curve, about
+     3 cm on tight corners, and that was causing crashes in testing.
 
-  8. REPLAN POLICY.  we keep the current path while it is valid, and replan when:
-       - newly blocked cells make the remaining path unsafe (checked every tick a cell turns blocked).  if the problem is
-         close ahead we replan immediately, farther away we allow a few ticks' delay to save compute.
-       - blocked cells turned free (a wall was removed, 09 / 11): a shorter path may now exist.
-       - periodically, and whenever we drift far off the path.
-     a new path replaces a still-valid one only if it is clearly shorter (hysteresis), so we don't flip between two
-     near-equal routes.  we never stop to replan: planning happens inside the same tick.
-     if no path to the goal exists (11), we drive to the reachable cell closest to the goal, park there watching the
-     blocking wall, and keep replanning until an opening appears.
+  8. when to replan.
+       - new walls block the path: replan right away if the problem is close, otherwise within a few ticks.
+       - a wall disappeared (09, 11): look for a shorter way.
+       - every so often, and if the robot ends up too far off the path.
+     a new path only replaces the old one if it's clearly shorter, so it doesn't keep flipping between two similar
+     routes.  planning happens inside the tick, so the robot never stops to think.
+     if there's no way to the goal at all (11), it goes to the closest spot it can reach, waits there watching the
+     wall, and keeps checking until a gap opens.
 
-  determinism: nothing here is random and all iteration orders are fixed, so runs are deterministic.
+  nothing is random, so every run gives the same result.
 
-  what is missing / known limits:
-    - A* replans from scratch (no D* Lite).  fine at this grid size (~10k cells), but it is the main cost per replan.
-    - the smoother is greedy (not globally optimal any-angle like Theta*), so some paths are a little longer than needed.
-    - corner speeds come from a geometric model tuned against these scenarios, not a full trajectory optimisation.
-    - exploration is purely optimistic: a dead end deeper than the scan range (06) is only discovered by driving in.
-    - the soft wall cost trades a little path length for safety margin; its weights were tuned on these scenarios.
+  limits / what I'd improve
+    - A* starts from scratch every replan (no D* Lite).  fine for a grid this size, but it's the slowest part.
+    - the straightening is greedy rather than a true any-angle planner like Theta*, so some paths are a bit long.
+    - corner speeds come from a simple geometry model tuned on these scenarios, not a proper trajectory optimiser.
+    - it only finds out a dead end is a dead end by driving in (06), since it can't see past 2.5 m.
+    - the extra cost near walls makes paths a little longer in exchange for safety, and its weights were tuned on
+      these scenarios.
 """
 
 import heapq, math
